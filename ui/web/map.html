@@ -1,0 +1,87 @@
+<!-- dxf2gis_gui/ui/web/map.html -->
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>DXF2GIS Preview</title>
+<style>
+  html,body,#map{height:100%;margin:0}
+  .leaflet-container{font:12px/1.2 sans-serif}
+  #msg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+       font:14px sans-serif;background:#111;color:#fff;z-index:9999;opacity:.92;text-align:center;padding:12px}
+</style>
+<link id="leaflet-css" rel="stylesheet" href="leaflet.css"/>
+</head>
+<body>
+<div id="map"></div>
+<div id="msg"></div>
+<script>
+function showMsg(html){ const m=document.getElementById('msg'); m.innerHTML=html; m.style.display='flex'; }
+function loadScript(src, ok, fail){ const s=document.createElement('script'); s.src=src; s.onload=ok; s.onerror=fail; document.head.appendChild(s); }
+function loadCss(href){ const l=document.getElementById('leaflet-css')||document.createElement('link'); l.rel='stylesheet'; l.href=href; l.id='leaflet-css'; document.head.appendChild(l); }
+
+function boot(){
+  const map = L.map('map').setView([23.7,120.9], 7); // 先 setView 避免錯誤
+  const base = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
+  base.addTo(map);
+
+  const overlays = {};
+
+  function colorFor(name){ let h=0; for(const c of name) h=(h*31+c.charCodeAt(0))>>>0; return `hsl(${h%360},65%,50%)`; }
+
+  window.loadLayers = function(payloads){
+    for(const k in overlays){ map.removeLayer(overlays[k]); delete overlays[k]; }
+    let bounds=null;
+    for(const p of payloads){
+      const style = Object.assign({color:colorFor(p.name), weight:2, fillColor:colorFor(p.name), fillOpacity:.25, radius:4}, p.style||{});
+      const onEach = (f, layer)=>{
+        const props=f.properties||{}; const keys=Object.keys(props).filter(k=>k!=='__fid').slice(0,8);
+        if(keys.length){ layer.bindPopup(keys.map(k=>`<b>${k}</b>: ${props[k]}`).join('<br/>')); }
+      };
+      const pointToLayer=(f, latlng)=> L.circleMarker(latlng,{radius:style.radius,color:style.color,fillColor:style.fillColor,fillOpacity:style.fillOpacity});
+      const gj = L.geoJSON(p.geojson, {style:_=>style, pointToLayer, onEachFeature:onEach}).addTo(map);
+      overlays[p.name] = gj;
+      if(gj.getBounds && gj.getBounds().isValid()){ bounds = bounds ? bounds.extend(gj.getBounds()) : gj.getBounds(); }
+    }
+    if(bounds && bounds.isValid()) map.fitBounds(bounds.pad(0.1));
+  };
+
+  window.fitAll = function(){
+    let b=null;
+    for(const k in overlays){ const lb = overlays[k].getBounds?.(); if(lb && lb.isValid()) b = b ? b.extend(lb) : lb; }
+    if(b) map.fitBounds(b.pad(0.1));
+  };
+  window.fitLayer = function(name){
+    const l=overlays[name]; if(!l) return;
+    const b=l.getBounds?.(); if(b && b.isValid()) map.fitBounds(b.pad(0.1));
+  };
+  window.get_current_bbox = function(){
+    const b=map.getBounds();
+    return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  };
+
+  // QWebChannel（可用時自動註冊）
+  function ensureWebChannel(cb){
+    if(window.QWebChannel){ return cb(); }
+    loadScript('qrc:///qtwebchannel/qwebchannel.js', cb, cb);
+  }
+  ensureWebChannel(function(){
+    if(window.qt && qt.webChannelTransport){
+      new QWebChannel(qt.webChannelTransport, function(channel){
+        window.bridge = channel.objects.bridge || {};
+      });
+    }
+  });
+}
+
+// 先 CDN，再本地；都不行才提示
+loadCss('https://unpkg.com/leaflet@1.9.4/dist/leaflet.css');
+loadScript('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', boot, function(){
+  loadCss('leaflet.css');
+  loadScript('leaflet.js', boot, function(){
+    showMsg('Leaflet 載入失敗：<br>請連網或將 leaflet.css 與 leaflet.js 放到 ui/web/。');
+  });
+});
+</script>
+</body>
+</html>

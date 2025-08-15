@@ -3,18 +3,21 @@ from __future__ import annotations
 import os
 import pathlib
 import time
-import traceback
-from typing import List, Optional, Set
+import json
+from typing import List, Optional, Set, Dict
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem,
-    QLineEdit, QTextEdit, QGroupBox, QCheckBox, QComboBox, QProgressBar, QDoubleSpinBox
+    QLineEdit, QGroupBox, QCheckBox, QComboBox, QProgressBar, QDoubleSpinBox
 )
 
 from services.conversion_service import precise_convert, write_outputs
 import ezdxf
+
+# Map widget (Leaflet in QWebEngine)
+from ui.map_view import MapView
 
 
 # -------- Fast layer scan (ezdxf only) --------
@@ -44,7 +47,6 @@ def fast_scan_layers(dxf_paths: List[str]) -> List[str]:
 class TaskThread(QThread):
     finished = Signal(object)  # result payload
     error = Signal(str)
-    log = Signal(str)          # optional progress from worker
 
     def __init__(self, fn):
         super().__init__()
@@ -55,23 +57,21 @@ class TaskThread(QThread):
             res = self._fn()
             self.finished.emit(res)
         except Exception as ex:
+            import traceback
             tb = traceback.format_exc()
             self.error.emit(f"{ex}\n--- TRACEBACK ---\n{tb}")
 
 
-# -------- Main Window --------
+# -------- Main Window (no log panel; right = map) --------
 class MainWindow(QMainWindow):
-    # thread-safe log signal (append to QTextEdit on GUI thread)
-    logSig = Signal(str)
-
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DXF → GIS Converter (PySide6)")
-        self.resize(1120, 720)
+        self.setWindowTitle("DXF → GIS Converter (PySide6 + Leaflet)")
+        self.resize(1200, 760)
 
         self._files: List[str] = []
         self._running_threads: List[QThread] = []
-        self._busy: bool = False  # guard to prevent re-entrance
+        self._busy: bool = False
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -160,13 +160,16 @@ class MainWindow(QMainWindow):
         layerL.addWidget(self.lstLayers, 1)
         left.addWidget(layerBox, 3)
 
-        # --- Actions ---
+        # --- Actions (Analyze, Show in Map, Convert) ---
         opsRow = QHBoxLayout()
         self.btnAnalyze = QPushButton("Analyze Layers")
+        self.btnShowMap = QPushButton("Show in Map")
         self.btnConvert = QPushButton("Convert")
         self.btnAnalyze.clicked.connect(self.do_analyze)
+        self.btnShowMap.clicked.connect(self.do_show_in_map)
         self.btnConvert.clicked.connect(self.do_convert)
         opsRow.addWidget(self.btnAnalyze)
+        opsRow.addWidget(self.btnShowMap)
         opsRow.addWidget(self.btnConvert)
         left.addLayout(opsRow)
 
@@ -178,38 +181,18 @@ class MainWindow(QMainWindow):
         prgRow.addWidget(self.prog)
         left.addLayout(prgRow)
 
-        # ===== Right: log =====
-        right = QVBoxLayout()
-        main.addLayout(right, 2)
-
-        self.logView = QTextEdit()
-        self.logView.setReadOnly(True)
-        right.addWidget(QLabel("Log"))
-        right.addWidget(self.logView, 1)
-
-        # connect thread-safe logger
-        self.logSig.connect(self.logView.append)
+        # ===== Right: map (Leaflet) =====
+        self.map = MapView(self)
+        main.addWidget(self.map, 5)
+        self.map.load_empty()
 
     # -------- helpers --------
-    def _log(self, msg: str):
-        self.logSig.emit(str(msg))
-
     def _set_busy(self, busy: bool):
         self._busy = busy
         self.prog.setVisible(busy)
         # disable/enable buttons to avoid concurrent runs
-        for w in (self.btnAnalyze, self.btnConvert, self.btnPick, self.btnOut, self.btnSelAll, self.btnClear):
+        for w in (self.btnAnalyze, self.btnConvert, self.btnPick, self.btnOut, self.btnSelAll, self.btnClear, self.btnShowMap):
             w.setEnabled(not busy)
-
-    def _track(self, th: QThread):
-        self._running_threads.append(th)
-        def cleanup():
-            try:
-                self._running_threads.remove(th)
-            except ValueError:
-                pass
-            th.deleteLater()
-        th.finished.connect(cleanup)
 
     def _append_layers(self, layers: List[str]):
         self.lstLayers.clear()
@@ -217,7 +200,6 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(name)
             it.setData(Qt.UserRole, name)
             self.lstLayers.addItem(it)
-        self._log(f"[layers] Loaded {len(layers)} layers.")
 
     def _selected_layers(self) -> Optional[List[str]]:
         items = self.lstLayers.selectedItems()
@@ -228,11 +210,9 @@ class MainWindow(QMainWindow):
     # -------- UI events --------
     def on_select_all_layers(self):
         self.lstLayers.selectAll()
-        self._log("[layers] Select all.")
 
     def on_clear_layers(self):
         self.lstLayers.clearSelection()
-        self._log("[layers] Cleared selection (no selection means all).")
 
     def on_pick(self):
         if self._busy:
@@ -242,7 +222,7 @@ class MainWindow(QMainWindow):
             return
         self.inPath.setText(path)
         self._files = [path]
-        self._log(f"[file] Input: {path}")
+        QMessageBox.information(self, "Info", f"Input: {path}")
 
     def on_pick_out(self):
         if self._busy:
@@ -251,7 +231,7 @@ class MainWindow(QMainWindow):
         if not d:
             return
         self.outPath.setText(d)
-        self._log(f"[out] Output: {d}")
+        QMessageBox.information(self, "Info", f"Output: {d}")
 
     # -------- Actions --------
     def do_analyze(self):
@@ -263,12 +243,10 @@ class MainWindow(QMainWindow):
 
         dxf_path = self._files[0]
         if not os.path.isfile(dxf_path):
-            self._log(f"[error] DXF not found: {dxf_path}")
             QMessageBox.critical(self, "Error", f"DXF not found:\n{dxf_path}")
             return
 
         self._set_busy(True)
-        self._log("[analyze] Scanning layers (fast)…")
         t0 = time.perf_counter()
 
         def task_fn():
@@ -278,7 +256,6 @@ class MainWindow(QMainWindow):
         th.finished.connect(lambda layers: self._analyze_finished(th, layers, t0))
         th.error.connect(lambda msg: self._task_error(th, msg))
         th.start()
-        self._track(th)
 
     def _analyze_finished(self, th: TaskThread, layers: List[str], t0: float):
         if QThread.currentThread() is not th:
@@ -286,12 +263,84 @@ class MainWindow(QMainWindow):
         dt = time.perf_counter() - t0
         self._set_busy(False)
         if not layers:
-            self._log("[analyze] No layers found.")
             QMessageBox.information(self, "Done", "No layers found.")
             return
         self._append_layers(layers)
-        self._log(f"[analyze] Done. Layers={len(layers)} time={dt:.2f}s")
         QMessageBox.information(self, "Done", f"Found {len(layers)} layers. (time {dt:.2f}s)")
+
+    def do_show_in_map(self):
+        """Build a light-weight GeoJSON preview for selected (or all) layers and render on map."""
+        if self._busy:
+            return
+        if not self._files:
+            QMessageBox.warning(self, "Notice", "Please choose a DXF file first.")
+            return
+
+        try:
+            src = int(self.srcEpsg.text().strip() or "3826")
+        except Exception:
+            src = 3826
+
+        target_layers = self._selected_layers()  # None => all
+        keep_blocks = self.chkKeepBlocks.isChecked()
+        mode = "keep-merge" if keep_blocks else "explode"
+
+        # Build preview in background (target_crs = 4326 for web map)
+        self._set_busy(True)
+
+        def task_fn():
+            # Faster settings for preview: target_epsg=4326, lighter tolerance
+            buckets = precise_convert(
+                self._files,
+                source_epsg=src,
+                target_epsg=4326,
+                include_3d=False,
+                bbox_wgs84=None,
+                target_layers=target_layers,
+                block_mode="explode" if mode == "explode" else "keep-merge",
+                line_merge_tol=0.5,               # looser tolerance for preview
+                fallback_explode_lines=True,
+                on_progress=None,                 # no logging to UI
+            )
+            # Convert each bucket to GeoJSON dict (limit features per layer to keep the map fast)
+            # buckets: Dict[(layer, geom), GeoDataFrame]
+            result: Dict[str, dict] = {}
+            MAX_FEAT = 1000  # per bucket cap; adjust if needed
+            for (layer, geom), gdf in buckets.items():
+                if gdf.empty:
+                    continue
+                # Limit features
+                if len(gdf) > MAX_FEAT:
+                    gdf = gdf.iloc[:MAX_FEAT].copy()
+                # Ensure CRS is WGS84
+                try:
+                    if str(getattr(gdf, "crs", None)).upper() not in ("EPSG:4326", "EPSG:4326"):
+                        gdf = gdf.to_crs(4326)
+                except Exception:
+                    pass
+                gj_text = gdf.to_json(drop_id=True)
+                try:
+                    gj_obj = json.loads(gj_text)
+                except Exception:
+                    continue
+                key = f"{layer} ({geom})"
+                result[key] = gj_obj
+            return result
+
+        th = TaskThread(task_fn)
+        th.finished.connect(lambda payload: self._show_map_finished(th, payload))
+        th.error.connect(lambda msg: self._task_error(th, msg))
+        th.start()
+
+    def _show_map_finished(self, th: TaskThread, payload: Dict[str, dict]):
+        if QThread.currentThread() is not th:
+            th.wait()
+        self._set_busy(False)
+        if not payload:
+            QMessageBox.information(self, "Map", "No features to show.")
+            return
+        # Send to map
+        self.map.show_geojson(payload)
 
     def do_convert(self):
         if self._busy:
@@ -302,7 +351,6 @@ class MainWindow(QMainWindow):
 
         dxf_path = self._files[0]
         if not os.path.isfile(dxf_path):
-            self._log(f"[error] DXF not found: {dxf_path}")
             QMessageBox.critical(self, "Error", f"DXF not found:\n{dxf_path}")
             return
 
@@ -313,7 +361,6 @@ class MainWindow(QMainWindow):
         try:
             pathlib.Path(outp).mkdir(parents=True, exist_ok=True)
         except Exception as ex:
-            self._log(f"[error] Cannot create output folder: {outp} → {ex}")
             QMessageBox.critical(self, "Error", f"Cannot create output folder:\n{outp}\n{ex}")
             return
 
@@ -329,23 +376,14 @@ class MainWindow(QMainWindow):
             tgt = None
 
         target_layers = self._selected_layers()
-        if target_layers is None:
-            self._log("[convert] No layer selected → using ALL layers.")
-        else:
-            preview = ", ".join(target_layers[:6])
-            suffix = "…" if len(target_layers) > 6 else ""
-            self._log(f"[convert] Layers selected ({len(target_layers)}): {preview}{suffix}")
-
         keep_blocks = self.chkKeepBlocks.isChecked()
         mode = "keep-merge" if keep_blocks else "explode"
         merge_tol = float(self.spinMergeTol.value())
 
         self._set_busy(True)
         t0 = time.perf_counter()
-        self._log(f"[convert] Start… driver={drv} src={src} tgt={tgt} mode={mode} tol={merge_tol}")
 
         def task_fn():
-            t_conv0 = time.perf_counter()
             buckets = precise_convert(
                 self._files,
                 source_epsg=src,
@@ -356,69 +394,39 @@ class MainWindow(QMainWindow):
                 block_mode=mode,
                 line_merge_tol=merge_tol,
                 fallback_explode_lines=True,
-                on_progress=self._log,  # thread-safe
+                on_progress=None,  # no UI logging
             )
-            t_conv = time.perf_counter() - t_conv0
-
-            t_write0 = time.perf_counter()
             written = write_outputs(
                 buckets,
                 out_path=outp,
                 driver=drv,
                 overwrite=self.chkOverwrite.isChecked(),
-                on_progress=self._log  # thread-safe
+                on_progress=None,  # no UI logging
             )
-            t_write = time.perf_counter() - t_write0
-
-            return {"written": written, "t_convert": t_conv, "t_write": t_write}
+            return written
 
         th = TaskThread(task_fn)
-        th.finished.connect(lambda res: self._convert_finished(th, res, t0))
+        th.finished.connect(lambda written: self._convert_finished(th, written, t0))
         th.error.connect(lambda msg: self._task_error(th, msg))
         th.start()
-        self._track(th)
 
-    def _convert_finished(self, th: TaskThread, payload, t0: float):
+    def _convert_finished(self, th: TaskThread, written, t0: float):
         if QThread.currentThread() is not th:
             th.wait()
-        total = time.perf_counter() - t0
         self._set_busy(False)
-
-        if not payload or not payload.get("written"):
-            self._log("[write] No files written (maybe nothing matched the condition).")
+        dt = time.perf_counter() - t0
+        if not written:
             QMessageBox.information(self, "Done", "No files were written.")
             return
-
-        written = payload["written"]
-        t_convert = payload.get("t_convert", 0.0)
-        t_write = payload.get("t_write", 0.0)
-
         lines = [f"- {w['layer']} ({w['count']}) → {w['path']}" for w in written]
         summary = "\n".join(lines)
-        self._log(f"[convert] Done. buckets={len(written)} convert={t_convert:.2f}s write={t_write:.2f}s total={total:.2f}s")
-        self._log("Write complete:\n" + summary)
-        QMessageBox.information(self, "Done",
-                                f"Successfully wrote {len(written)} layer(s).\n\n"
-                                f"Convert: {t_convert:.2f}s\nWrite: {t_write:.2f}s\nTotal: {total:.2f}s\n\n"
-                                f"{summary}")
+        QMessageBox.information(self, "Done", f"Successfully wrote {len(written)} layer(s) in {dt:.2f}s.\n\n{summary}")
 
     def _task_error(self, th: TaskThread, msg: str):
         if QThread.currentThread() is not th:
             th.wait()
         self._set_busy(False)
-        self._log(f"[ERROR]\n{msg}")
         QMessageBox.critical(self, "Error", msg)
-
-    # graceful shutdown
-    def closeEvent(self, event):
-        for th in list(self._running_threads):
-            try:
-                if th.isRunning():
-                    th.requestInterruption()
-                    th.wait(5000)
-            except Exception:
-                pass
-        super().closeEvent(event)
 
 
 if __name__ == "__main__":
