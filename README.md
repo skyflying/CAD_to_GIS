@@ -54,3 +54,5 @@ python dxf2gis_gui/app.py
 - Pick specific layers or use Select All / Clear All buttons.
 7. Convert
 -  Click "Convert" to start. Progress and logs will be shown in the right panel.
+
+![image](https://github.com/skyflying/CAD_to_GIS/blob/main/Image.jpg)
