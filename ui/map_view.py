@@ -1,168 +1,146 @@
 # dxf2gis_gui/ui/map_view.py
 from __future__ import annotations
 import json
-from typing import Dict
+from typing import Dict, Any, Tuple, Optional, List
 
 from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
-
-try:
-    from PySide6.QtWebEngineWidgets import QWebEngineView
-    _WEBENGINE_OK = True
-except Exception:
-    QWebEngineView = None
-    _WEBENGINE_OK = False
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
-_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+_LEAFLET_HTML_TMPL = """<!doctype html>
+<html>
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="initial-scale=1, width=device-width, user-scalable=no"/>
-<link
-  rel="stylesheet"
-  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-  crossorigin=""
-/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DXF Preview Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
-html, body, #map { height:100%; width:100%; margin:0; padding:0; }
-.leaflet-container { background:#f7f7f7; }
-.layer-label {
-  position: absolute;
-  top: 8px; left: 8px;
-  background: rgba(255,255,255,0.85);
-  padding: 6px 8px; border-radius: 4px;
-  font: 12px/1.2 Arial, sans-serif;
-  max-width: 40%;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
+html, body, #map { width:100%; height:100%; margin:0; padding:0; }
+.leaflet-tooltip.layer-label { background:rgba(0,0,0,0.6); color:#fff; border:none; }
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div id="ll" class="layer-label" style="display:none;"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-  crossorigin=""></script>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-var map = L.map('map', {zoomControl:true}).setView([23.5, 121], 7);
-var base = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+// Initialize map
+const map = L.map('map', { preferCanvas: true }).setView([23.7, 121.0], 6);
+
+// Base layer (no SRI / crossorigin to avoid local restrictions)
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  attribution: '&copy; OpenStreetMap'
+  attribution: '© OpenStreetMap contributors'
 }).addTo(map);
 
-var group = L.layerGroup().addTo(map);
-var lbl = document.getElementById('ll');
+// Global feature group
+window._fg = L.featureGroup().addTo(map);
 
-function styleByGeom(geomType) {
-  switch (geomType) {
-    case 'Point': case 'MultiPoint':
-      return null; // handled by pointToLayer
-    case 'LineString': case 'MultiLineString':
-      return {color:'#0077ff', weight:1.2, opacity:0.9};
-    case 'Polygon': case 'MultiPolygon':
-      return {color:'#ff6a00', weight:1, fillColor:'#ff9d57', fillOpacity:0.25};
-    default:
-      return {color:'#666', weight:1, opacity:0.8};
-  }
+// Colors
+const COLORS = [
+  '#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00',
+  '#ffff33','#a65628','#f781bf','#999999'
+];
+function colorFor(i) { return COLORS[i % COLORS.length]; }
+
+function clearLayers() {
+  try { window._fg.clearLayers(); } catch(e) {}
 }
 
-function pointSymbol(feature, latlng) {
-  return L.circleMarker(latlng, {radius:3, color:'#1f7a1f', fillColor:'#2ecc71', fillOpacity:0.8, weight:1});
+function addGeoJson(name, gj, colorIdx) {
+  const style = function(f) {
+    return {
+      color: colorFor(colorIdx),
+      weight: 2,
+      opacity: 0.9,
+      fillColor: colorFor(colorIdx),
+      fillOpacity: 0.2
+    };
+  };
+  const layer = L.geoJSON(gj, {
+    style: style,
+    pointToLayer: (f, latlng) => L.circleMarker(latlng, {
+      radius: 4, color: colorFor(colorIdx),
+      fillColor: colorFor(colorIdx), fillOpacity: 0.9, weight: 1
+    })
+  });
+  layer.bindTooltip(name, {className:'layer-label'});
+  window._fg.addLayer(layer);
+  return layer;
 }
 
-window.showGeoJSON = function(payload) {
-  group.clearLayers();
-  var bounds = null;
-  var labels = [];
+// Set layers from payload: { "Layer (GEOM)": FeatureCollection, ... }
+window.setGeoJsonLayers = function(payload) {
+  clearLayers();
+  const names = Object.keys(payload || {});
+  names.sort();
+  names.forEach((name, idx) => {
+    try { addGeoJson(name, payload[name], idx); }
+    catch(e) { console.error('Failed to add layer', name, e); }
+  });
+};
 
-  for (var lname in payload) {
-    try {
-      var gj = payload[lname];
-      var layer = L.geoJSON(gj, {
-        style: function(f) { return styleByGeom(f.geometry ? f.geometry.type : ''); },
-        pointToLayer: pointSymbol
-      });
-      layer.addTo(group);
-      labels.push(lname + " (" + layer.getLayers().length + ")");
-      try {
-        var b = layer.getBounds();
-        if (b && b.isValid && b.isValid()) {
-          bounds = bounds ? bounds.extend(b) : b;
-        }
-      } catch(e){}
-    } catch(e) {
-      console.error("Failed layer:", lname, e);
-    }
-  }
-
-  if (bounds) {
-    try { map.fitBounds(bounds.pad(0.1)); } catch(e) {}
-  }
-
-  if (labels.length) {
-    lbl.style.display = 'block';
-    lbl.textContent = labels.join(' | ');
-  } else {
-    lbl.style.display = 'none';
-  }
+window.fitToBounds = function(swLat, swLng, neLat, neLng) {
+  try {
+    const b = L.latLngBounds(L.latLng(swLat, swLng), L.latLng(neLat, neLng));
+    if (b.isValid()) map.fitBounds(b, {padding:[20,20]});
+  } catch(e) { console.error('fitToBounds error', e); }
 };
 </script>
 </body>
 </html>
 """
 
-
-class MapView(QWidget):
-    """Leaflet map inside QWebEngineView. Exposes `show_geojson(dict)` to render."""
+class MapView(QWebEngineView):
+    """
+    Leaflet-based preview in a QWebEngineView.
+    expose:
+      - load_empty()
+      - show_geojson(dict[str -> GeoJSON])
+      - fit_bounds((south, west, north, east))
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
-        lyt = QVBoxLayout(self)
-        lyt.setContentsMargins(0, 0, 0, 0)
+        self._ready: bool = False
+        self._pending_js: List[str] = []
+        self.loadFinished.connect(self._on_loaded)
 
-        if not _WEBENGINE_OK:
-            lyt.addWidget(QLabel(
-                "Qt WebEngine is not available.\n"
-                "Please install PySide6-Addons (QtWebEngine) to enable map preview."
-            ))
-            self._view = None
-            return
-
-        self._view = QWebEngineView(self)
-        lyt.addWidget(self._view, 1)
-        self._loaded = False
+    def _on_loaded(self, ok: bool):
+        self._ready = bool(ok)
+        if self._ready and self._pending_js:
+            for code in self._pending_js:
+                try:
+                    self.page().runJavaScript(code)
+                except Exception:
+                    pass
+            self._pending_js.clear()
 
     def load_empty(self):
-        if not self._view:
-            return
-        # Set inline HTML (Leaflet via CDN)
-        self._view.setHtml(_HTML, baseUrl=QUrl("https://local.resource/"))
-        self._loaded = True
+        # Use setHtml to avoid local file issues and SRI restrictions
+        self._ready = False
+        # baseUrl helps Leaflet fetch relative assets if any (we use CDN anyway)
+        self.setHtml(_LEAFLET_HTML_TMPL, baseUrl=QUrl("https://unpkg.com/"))
 
-    def show_geojson(self, layer_to_geojson: Dict[str, dict]):
-        """Render a dict: { 'LayerName (GEOM)': <GeoJSON dict> }."""
-        if not self._view:
-            return
-        if not self._loaded:
-            self.load_empty()
-
-        # Serialize payload to JS
+    def _run_js(self, code: str):
         try:
-            js_arg = json.dumps(layer_to_geojson)
+            if self._ready and self.page():
+                self.page().runJavaScript(code)
+            else:
+                self._pending_js.append(code)
+                # ensure page is loaded once
+                if self.url().isEmpty():
+                    self.load_empty()
         except Exception:
-            # As fallback, try to coerce each value to dict
-            fixed = {}
-            for k, v in layer_to_geojson.items():
-                if isinstance(v, str):
-                    try:
-                        fixed[k] = json.loads(v)
-                    except Exception:
-                        continue
-                else:
-                    fixed[k] = v
-            js_arg = json.dumps(fixed)
+            pass
 
-        self._view.page().runJavaScript(f"window.showGeoJSON({js_arg});")
+    def show_geojson(self, layers: Dict[str, Any]):
+        if self.url().isEmpty():
+            self.load_empty()
+        payload = json.dumps(layers, ensure_ascii=False)
+        self._run_js(f"window.setGeoJsonLayers({payload});")
+
+    def fit_bounds(self, bounds: Tuple[float, float, float, float]):
+        if not bounds:
+            return
+        s, w, n, e = bounds
+        self._run_js(f"window.fitToBounds({s}, {w}, {n}, {e});")
