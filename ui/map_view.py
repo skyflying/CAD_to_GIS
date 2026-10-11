@@ -1,6 +1,7 @@
 # dxf2gis_gui/ui/map_view.py
 from __future__ import annotations
 import json
+import os
 from typing import Dict, Any, Tuple, Optional, List
 
 from PySide6.QtCore import QUrl
@@ -13,7 +14,7 @@ _LEAFLET_HTML_TMPL = """<!doctype html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DXF Preview Map</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+__LEAFLET_CSS__
 <style>
 html, body, #map { width:100%; height:100%; margin:0; padding:0; }
 .leaflet-tooltip.layer-label { background:rgba(0,0,0,0.6); color:#fff; border:none; }
@@ -22,7 +23,7 @@ html, body, #map { width:100%; height:100%; margin:0; padding:0; }
 <body>
 <div id="map"></div>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+__LEAFLET_JS__
 <script>
 // Initialize map
 const map = L.map('map', { preferCanvas: true }).setView([23.7, 121.0], 6);
@@ -91,6 +92,27 @@ window.fitToBounds = function(swLat, swLng, neLat, neLng) {
 </html>
 """
 
+_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+
+
+def _build_html() -> str:
+    """Inline the bundled ui/web/leaflet.{js,css} so the preview also works offline
+    (the old page only loaded Leaflet from unpkg; without internet `L` was undefined
+    and every map call failed silently). Falls back to the CDN if files are missing."""
+    css_tag = '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>'
+    js_tag = '<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>'
+    try:
+        with open(os.path.join(_WEB_DIR, "leaflet.css"), encoding="utf-8") as f:
+            css_tag = "<style>\n" + f.read() + "\n</style>"
+        with open(os.path.join(_WEB_DIR, "leaflet.js"), encoding="utf-8") as f:
+            js = f.read()
+        if "</script" not in js.lower():
+            js_tag = "<script>\n" + js + "\n</script>"
+    except Exception:
+        pass
+    return _LEAFLET_HTML_TMPL.replace("__LEAFLET_CSS__", css_tag).replace("__LEAFLET_JS__", js_tag)
+
+
 class MapView(QWebEngineView):
     """
     Leaflet-based preview in a QWebEngineView.
@@ -119,7 +141,7 @@ class MapView(QWebEngineView):
         # Use setHtml to avoid local file issues and SRI restrictions
         self._ready = False
         # baseUrl helps Leaflet fetch relative assets if any (we use CDN anyway)
-        self.setHtml(_LEAFLET_HTML_TMPL, baseUrl=QUrl("https://unpkg.com/"))
+        self.setHtml(_build_html(), baseUrl=QUrl("https://unpkg.com/"))
 
     def _run_js(self, code: str):
         try:

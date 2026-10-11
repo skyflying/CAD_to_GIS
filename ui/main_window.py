@@ -25,30 +25,43 @@ from ui.map_view import MapView
 
 # -------- Fast layer scan (ezdxf only) --------
 def fast_scan_layers(dxf_paths: List[str]) -> List[str]:
+    """Layers used in modelspace + layers used inside referenced blocks (nested too).
+    Each block definition is scanned once (the old version expanded every INSERT,
+    capped at 20 children, and missed nested blocks)."""
     layers: Set[str] = set()
     for path in dxf_paths:
         doc = ezdxf.readfile(path)
-        msp = doc.modelspace()
-        for e in msp:
-            layer = getattr(e.dxf, "layer", "0") or "0"
-            layers.add(layer)
+        todo: List[str] = []
+        for e in doc.modelspace():
+            layers.add(getattr(e.dxf, "layer", "0") or "0")
             if e.dxftype() == "INSERT":
-                try:
-                    k = 0
-                    for se in e.virtual_entities():
-                        sl = getattr(se.dxf, "layer", "0") or "0"
-                        layers.add(sl)
-                        k += 1
-                        if k >= 20:
-                            break
-                except Exception:
-                    pass
+                todo.append(e.dxf.name)
+        seen: Set[str] = set()
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            blk = doc.blocks.get(name)
+            if blk is None:
+                continue
+            for se in blk:
+                if se.dxftype() in ("ATTDEF",):
+                    continue
+                sl = getattr(se.dxf, "layer", "0") or "0"
+                if sl != "0":          # layer-0 children inherit the INSERT's layer
+                    layers.add(sl)
+                if se.dxftype() == "INSERT":
+                    todo.append(se.dxf.name)
     return sorted(layers)
 
 
 # -------- Simple QThread subclass to run a function --------
 class TaskThread(QThread):
-    finished = Signal(object)  # result payload
+    # NOTE: must NOT be called "finished" -- that would shadow QThread.finished,
+    # which Qt emits (with no args) when run() returns. The old code therefore
+    # ran the callback twice and called deleteLater() on a still-running thread.
+    result_ready = Signal(object)
     error = Signal(str)
 
     def __init__(self, fn):
@@ -58,7 +71,7 @@ class TaskThread(QThread):
     def run(self):
         try:
             res = self._fn()
-            self.finished.emit(res)
+            self.result_ready.emit(res)
         except Exception as ex:
             import traceback
             tb = traceback.format_exc()
@@ -105,7 +118,7 @@ def compute_geojson_bbox_for_selection(layers: Dict[str, Any], selected_layer_na
     keys: List[str] = []
     sel_set = set(selected_layer_names)
     for key in layers.keys():
-        base = key.split(" (", 1)[0]
+        base = key.rsplit(" (", 1)[0]   # layer names may themselves contain " ("
         if base in sel_set:
             keys.append(key)
     subset = {k: layers[k] for k in keys}
@@ -265,21 +278,19 @@ class MainWindow(QMainWindow):
         th = TaskThread(fn)
         self._threads.append(th)
         def _fin(res):
-            try:
-                on_finished(th, res)
-            finally:
-                if th in self._threads:
-                    self._threads.remove(th)
-                th.deleteLater()
+            on_finished(th, res)
         def _err(msg):
-            try:
-                on_error(th, msg)
-            finally:
-                if th in self._threads:
-                    self._threads.remove(th)
-                th.deleteLater()
-        th.finished.connect(_fin)
+            on_error(th, msg)
+        def _cleanup():
+            # only release the thread after run() has really returned
+            # (deleteLater() from the result callback -> "QThread: Destroyed while
+            # thread is still running" crash)
+            if th in self._threads:
+                self._threads.remove(th)
+            th.deleteLater()
+        th.result_ready.connect(_fin)
         th.error.connect(_err)
+        th.finished.connect(_cleanup)
         th.start()
         return th
 
@@ -430,8 +441,7 @@ class MainWindow(QMainWindow):
                 bbox_wgs84=None,
                 target_layers=target_layers,
                 block_mode=mode,
-                line_merge_tol=0.5,    # lighter for preview
-                fallback_explode_lines=True,
+                merge_tolerance=0.5,   # lighter for preview
                 on_progress=None,
             )
             result: Dict[str, dict] = {}
@@ -505,13 +515,14 @@ class MainWindow(QMainWindow):
         if not outp:
             QMessageBox.warning(self, "Notice", "Please choose an output folder.")
             return
+        drv = "GPKG" if (self.cmbDriver.currentText() == "GPKG" or outp.lower().endswith(".gpkg")) else "ESRI Shapefile"
         try:
-            pathlib.Path(outp).mkdir(parents=True, exist_ok=True)
+            # a .gpkg path is a FILE: create its parent folder, not a folder named *.gpkg
+            folder = os.path.dirname(os.path.abspath(outp)) if outp.lower().endswith(".gpkg") else outp
+            pathlib.Path(folder).mkdir(parents=True, exist_ok=True)
         except Exception as ex:
             QMessageBox.critical(self, "Error", f"Cannot create output folder:\n{outp}\n{ex}")
             return
-
-        drv = "GPKG" if (self.cmbDriver.currentText() == "GPKG" or outp.lower().endswith(".gpkg")) else "ESRI Shapefile"
 
         try:
             src = int(self.srcEpsg.text().strip() or "3826")
@@ -539,8 +550,7 @@ class MainWindow(QMainWindow):
                 bbox_wgs84=None,
                 target_layers=target_layers,
                 block_mode=mode,
-                line_merge_tol=merge_tol,
-                fallback_explode_lines=True,
+                merge_tolerance=merge_tol,
                 on_progress=None,
             )
             written = write_outputs(
