@@ -1,0 +1,9 @@
+PySide6>=6.5
+geopandas>=0.14
+pandas
+shapely>=2.0
+pyproj
+pyogrio        # or fiona
+ezdxf>=1.1     # optional but recommended (without it the GDAL/OGR pipeline is used)
+pyshp          # optional: Shapefile fallback writer
+# optional, for DWG read directly / OGR fallback: GDAL Python bindings (osgeo)

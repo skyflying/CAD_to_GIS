@@ -17,7 +17,8 @@ from contextlib import contextmanager
 import math
 import os
 import re
-import pandas as pd
+# NOTE: pandas / geopandas / shapely are imported inside functions, so this module
+# can be imported (e.g. by the QGIS plugin at load time) even when they are missing.
 
 ProgressCB = Optional[Callable[[str], None]]
 
@@ -1067,6 +1068,7 @@ def _convert_gdal_cad(
 def _merge_buckets(a: dict, b: dict) -> dict:
     """Combine two bucket dicts (same CRS), concatenating shared (layer, geom) keys."""
     import geopandas as gpd
+    import pandas as pd
     out = dict(a)
     for k, g in b.items():
         if k in out:

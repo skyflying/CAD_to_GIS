@@ -371,8 +371,11 @@ def libredwg_download_supported() -> bool:
 
 def _http_get(url: str, timeout: int = 60):
     import urllib.request
+    if not url.startswith("https://github.com/"):
+        raise ValueError(f"Refusing to download from an unexpected URL: {url}")
     req = urllib.request.Request(url, headers={"User-Agent": "CAD_to_GIS"})
-    return urllib.request.urlopen(req, timeout=timeout)   # honours system/IE proxy settings
+    # scheme/host checked above; honours system/IE proxy settings
+    return urllib.request.urlopen(req, timeout=timeout)  # nosec B310
 
 
 def _latest_libredwg_version() -> str:

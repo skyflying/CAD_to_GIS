@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
 )
 
 from services.conversion_service import precise_convert, write_outputs
-import ezdxf
 
 # DWG support: ODA -> LibreDWG -> GDAL CAD driver (R2000) -> guidance
 from services import dwg_support as dwg
@@ -25,6 +24,22 @@ from ui.map_view import MapView
 
 
 # -------- Fast layer scan (ezdxf only) --------
+def _ogr_dxf_layers(path: str) -> List[str]:
+    from osgeo import ogr
+    from services.conversion_service import _dxf_encoding_hint, _gdal_config
+    enc = _dxf_encoding_hint(path)
+    names: Set[str] = set()
+    with _gdal_config({"DXF_ENCODING": enc} if enc else {}):
+        ds = ogr.Open(path, 0)
+        if ds is None:
+            raise RuntimeError(f"Cannot open DXF: {path}")
+        lyr = ds.GetLayerByName("entities") or ds.GetLayer(0)
+        for f in lyr:
+            names.add(f.GetField("Layer") or "0")
+        ds = None
+    return sorted(names)
+
+
 def fast_scan_layers(dxf_paths: List[str]) -> List[str]:
     """Layers used in modelspace + layers used inside referenced blocks (nested too).
     Each block definition is scanned once (the old version expanded every INSERT,
@@ -33,6 +48,11 @@ def fast_scan_layers(dxf_paths: List[str]) -> List[str]:
     for path in dxf_paths:
         if path.lower().endswith(".dwg"):          # read directly by GDAL CAD driver
             layers.update(dwg.gdal_cad_layers(path))
+            continue
+        try:
+            import ezdxf
+        except ImportError:                       # no ezdxf → list layers with GDAL/OGR
+            layers.update(_ogr_dxf_layers(path))
             continue
         doc = ezdxf.readfile(path)
         todo: List[str] = []

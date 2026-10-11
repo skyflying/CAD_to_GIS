@@ -27,15 +27,18 @@ You can run the app from source or download a packaged executable.
 **Requirements** (Python 3.9+ recommended):
 
 ```bash
-pip install pyside6 geopandas shapely fiona pyproj pandas ezdxf
+pip install -r requirements.txt
 ```
 
 Run the app:
 ```bash
-python dxf2gis_gui/app.py
+python app.py
 ```
 
 ### From Executable (Windows)
+
+Build it yourself with PyInstaller: `pip install pyinstaller` then `python tools/build_exe.py` → `dist/CAD_to_GIS/CAD_to_GIS.exe`.
+
 
 ## 📐 DWG support (no ODA required)
 
@@ -71,3 +74,25 @@ Behind a proxy/firewall, download `libredwg-<ver>-win64.zip` manually from <http
 -  Click "Convert" to start. Progress and logs will be shown in the right panel.
 
 ![image](https://github.com/skyflying/CAD_to_GIS/blob/main/Image.jpg)
+
+
+---
+
+## 📝 Changelog
+
+### 1.5.0 – 2026-10-11
+- DWG without ODA: ODA → LibreDWG (optional one-click download, Windows) → GDAL CAD driver (DWG R2000) → guidance dialog; DWG reader status row with *Set ODA path / Download LibreDWG / ODA download page / Re-detect*
+- Fixed ODA File Converter call (wrong argument order; converted the whole input folder)
+- Fixed crash in *Show in Map* (`QThread` destroyed while running: the custom `finished` signal shadowed `QThread.finished`)
+- GPKG output no longer creates a *folder* named `xxx.gpkg`
+- Line-merge tolerance from the UI was ignored – fixed
+- Target EPSG and WGS84 bbox now applied in the ezdxf pipeline; OGR pipeline reprojects to EPSG:4326 too
+- GPKG layers named `<Layer>_<GEOM>` (LINE/POLYGON/POINT of one CAD layer no longer overwrite each other)
+- Chinese / non-ASCII layer names kept in output names (no more `__LINE.shp` collisions)
+- Nested blocks, layer-0 inheritance, hatch polyline boundaries and holes, arcs across 0°, block attributes (`ATT_*`)
+- OGR fallback: one feature per INSERT, block attributes by handle, UTF-8 for DXF R2007+
+- Map preview works offline (bundled Leaflet inlined)
+- Layer scan covers nested blocks
+- `tools/cli_convert.py` accepts DWG; `app.py` runs from any folder and exits cleanly (explicit window teardown)
+- Added `requirements.txt` and `tools/build_exe.py` (PyInstaller one-folder build)
+- Startup check lists missing Python packages with the exact pip command; ezdxf is optional when GDAL (osgeo) is installed
