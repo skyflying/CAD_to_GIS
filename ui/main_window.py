@@ -4,6 +4,7 @@ import os
 import pathlib
 import time
 import json
+import shutil
 from typing import List, Optional, Set, Dict, Tuple, Any
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -16,8 +17,8 @@ from PySide6.QtWidgets import (
 from services.conversion_service import precise_convert, write_outputs
 import ezdxf
 
-# Optional DWG support (external converters only; optional)
-from services.dwg_support import dwg_to_temp_dxf_auto, detect_dwg_converter
+# DWG support: ODA -> LibreDWG -> GDAL CAD driver (R2000) -> guidance
+from services import dwg_support as dwg
 
 # Map widget (Leaflet in QWebEngine)
 from ui.map_view import MapView
@@ -30,6 +31,9 @@ def fast_scan_layers(dxf_paths: List[str]) -> List[str]:
     capped at 20 children, and missed nested blocks)."""
     layers: Set[str] = set()
     for path in dxf_paths:
+        if path.lower().endswith(".dwg"):          # read directly by GDAL CAD driver
+            layers.update(dwg.gdal_cad_layers(path))
+            continue
         doc = ezdxf.readfile(path)
         todo: List[str] = []
         for e in doc.modelspace():
@@ -127,6 +131,8 @@ def compute_geojson_bbox_for_selection(layers: Dict[str, Any], selected_layer_na
 
 # -------- Main Window (DXF-first; optional DWG via external converter) --------
 class MainWindow(QMainWindow):
+    sig_percent = Signal(int)   # download progress from worker thread -> progress bar
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DXF → GIS Converter (PySide6 + Leaflet)")
@@ -138,14 +144,6 @@ class MainWindow(QMainWindow):
         self._threads: List[QThread] = []  # keep references to running threads
         self._last_map_payload: Dict[str, Any] = {}  # store last shown GeoJSON dict
 
-        # Detect optional DWG converter
-        self._dwg_converter = detect_dwg_converter()  # 'oda' | 'libredwg' | ''
-        if self._dwg_converter == "oda":
-            self._dwg_label = "ODA File Converter detected"
-        elif self._dwg_converter == "libredwg":
-            self._dwg_label = "LibreDWG (dwg2dxf) detected"
-        else:
-            self._dwg_label = "No DWG converter found (DXF only)"
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -210,17 +208,25 @@ class MainWindow(QMainWindow):
         self.spinMergeTol.setValue(0.2)
         parmRow2.addWidget(self.spinMergeTol)
 
-        parmRow2.addSpacing(12)
-        # Optional DWG toggle (only meaningful if converter is present)
-        self.chkEnableDWG = QCheckBox("Enable DWG (if available)")
-        self.chkEnableDWG.setChecked(False)  # default OFF to keep zero-install DXF-only
-        self.chkEnableDWG.setToolTip(self._dwg_label)
-        if not self._dwg_converter:
-            self.chkEnableDWG.setEnabled(False)
-        parmRow2.addWidget(self.chkEnableDWG)
-
         parmRow2.addStretch(1)
         fileL.addLayout(parmRow2)
+
+        # DWG reader row: status + tools (ODA path / LibreDWG download / re-detect)
+        dwgRow = QHBoxLayout()
+        dwgRow.addWidget(QLabel("DWG reader:"))
+        self.lblDwg = QLabel()
+        dwgRow.addWidget(self.lblDwg, 1)
+        self.btnSetOda = QPushButton("Set ODA path…")
+        self.btnGetLibre = QPushButton("Download LibreDWG")
+        self.btnOdaPage = QPushButton("ODA download page")
+        self.btnRedetect = QPushButton("Re-detect")
+        self.btnSetOda.clicked.connect(self.on_set_oda)
+        self.btnGetLibre.clicked.connect(lambda: self.on_download_libredwg())
+        self.btnOdaPage.clicked.connect(lambda: dwg.open_url(dwg.ODA_DOWNLOAD_URL))
+        self.btnRedetect.clicked.connect(self.refresh_dwg_status)
+        for b in (self.btnSetOda, self.btnGetLibre, self.btnOdaPage, self.btnRedetect):
+            dwgRow.addWidget(b)
+        fileL.addLayout(dwgRow)
 
         left.addWidget(fileBox)
 
@@ -273,6 +279,9 @@ class MainWindow(QMainWindow):
         main.addWidget(self.map, 5)
         self.map.load_empty()
 
+        self.sig_percent.connect(self._on_percent)
+        self.refresh_dwg_status()
+
     # -------- thread helper --------
     def _run_in_thread(self, fn, on_finished, on_error):
         th = TaskThread(fn)
@@ -298,9 +307,131 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool):
         self._busy = busy
         self.prog.setVisible(busy)
+        if not busy:
+            self.prog.setRange(0, 0)       # back to "busy" style for the next task
         for w in (self.btnAnalyze, self.btnConvert, self.btnPick, self.btnOut,
-                  self.btnSelAll, self.btnClear, self.btnShowMap, self.btnZoomSel, self.chkEnableDWG):
+                  self.btnSelAll, self.btnClear, self.btnShowMap, self.btnZoomSel,
+                  self.btnSetOda, self.btnGetLibre, self.btnRedetect):
             w.setEnabled(not busy)
+        if not busy:
+            self.btnGetLibre.setEnabled(dwg.libredwg_download_supported())
+
+    def _on_percent(self, pct: int):
+        self.prog.setRange(0, 100)
+        self.prog.setValue(pct)
+
+    # -------- DWG tools --------
+    def refresh_dwg_status(self):
+        st = dwg.detect_status()
+        self.lblDwg.setText(str(st["summary"]))
+        self.lblDwg.setToolTip("\n".join([
+            f"ODA: {st['oda'] or '-'}",
+            f"LibreDWG: {st['libredwg'] or '-'}",
+            f"GDAL CAD driver (DWG R2000 only): {'yes' if st['gdal_cad'] else 'no'}",
+        ]))
+        self.btnGetLibre.setEnabled(dwg.libredwg_download_supported() and not self._busy)
+        return st
+
+    def on_set_oda(self):
+        filt = "ODAFileConverter (ODAFileConverter*.exe)" if os.name == "nt" else "ODAFileConverter (ODAFileConverter*)"
+        p, _ = QFileDialog.getOpenFileName(self, "Locate ODAFileConverter", "", filt)
+        if p:
+            dwg.set_oda_path(p)
+            self.refresh_dwg_status()
+        return bool(p)
+
+    def on_download_libredwg(self, then=None):
+        if self._busy:
+            return
+        if not dwg.libredwg_download_supported():
+            QMessageBox.information(self, "LibreDWG",
+                                    "Automatic download is Windows-only. Please install LibreDWG "
+                                    "(dwg2dxf) with your package manager, then press Re-detect.")
+            return
+        ok = QMessageBox.question(
+            self, "Download LibreDWG",
+            "Download LibreDWG (GPL-3.0, ~12 MB) from github.com/LibreDWG/libredwg/releases\n"
+            f"into:\n{dwg.config_dir()}\n\nContinue?")
+        if ok != QMessageBox.Yes:
+            return
+        self._set_busy(True)
+        self.prog.setRange(0, 100)
+        self.prog.setValue(0)
+
+        def task_fn():
+            return dwg.download_libredwg(on_percent=self.sig_percent.emit)
+
+        def _done(_th, exe):
+            self._set_busy(False)
+            self.refresh_dwg_status()
+            QMessageBox.information(self, "LibreDWG", f"LibreDWG ready:\n{exe}")
+            if then:
+                then()
+
+        def _err(_th, msg):
+            self._set_busy(False)
+            QMessageBox.critical(self, "LibreDWG download failed",
+                                 msg.split("--- TRACEBACK ---")[0] +
+                                 "\n\nBehind a company proxy/firewall: download libredwg-<ver>-win64.zip "
+                                 f"manually from {dwg.LIBREDWG_RELEASES_URL}, unzip it into\n"
+                                 f"{os.path.join(dwg.config_dir(), 'libredwg')}\nand press Re-detect.")
+
+        self._run_in_thread(task_fn, _done, _err)
+
+    def _show_dwg_guidance(self, path: str, guidance: str):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Cannot read DWG")
+        box.setText(guidance)
+        b_lib = box.addButton("Download LibreDWG", QMessageBox.AcceptRole) if dwg.libredwg_download_supported() else None
+        b_oda = box.addButton("Set ODA path…", QMessageBox.ActionRole)
+        b_page = box.addButton("ODA download page", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if b_lib is not None and clicked is b_lib:
+            self.on_download_libredwg(then=lambda: self._load_dwg(path))
+        elif clicked is b_oda:
+            if self.on_set_oda():
+                self._load_dwg(path)
+        elif clicked is b_page:
+            dwg.open_url(dwg.ODA_DOWNLOAD_URL)
+
+    def _load_dwg(self, path: str):
+        """ODA / LibreDWG -> temp DXF; else GDAL CAD (R2000); else guidance dialog."""
+        self._set_busy(True)
+
+        def task_fn():
+            try:
+                return dwg.open_dwg(path, prefer="auto", dxf_version="ACAD2013")
+            except dwg.DwgUnavailableError as ex:
+                return ("unavailable", ex.guidance)
+
+        def _done(_th, res):
+            self._set_busy(False)
+            kind, value = res
+            if kind == "unavailable":
+                self._show_dwg_guidance(path, value)
+                return
+            if kind == "dxf":
+                self._temp_files.append(value)
+                self._files = [value]
+                self.inPath.setText(f"{path}  (via temp DXF)")
+                QMessageBox.information(self, "Info", "DWG converted to a temporary DXF. You can Analyze / Show / Convert now.")
+            else:
+                self._files = [value]
+                self.inPath.setText(f"{path}  (GDAL CAD driver)")
+                QMessageBox.information(
+                    self, "Info",
+                    "No ODA / LibreDWG found — reading this DWG R2000 directly with GDAL.\n"
+                    "Blocks are not kept/merged, and hatches, splines and some entities may be missing.\n"
+                    "Install ODA or download LibreDWG for full results.")
+
+        def _err(_th, msg):
+            self._set_busy(False)
+            QMessageBox.critical(self, "Error", msg)
+
+        self._run_in_thread(task_fn, _done, _err)
 
     def _append_layers(self, layers: List[str]):
         self.lstLayers.clear()
@@ -334,36 +465,7 @@ class MainWindow(QMainWindow):
 
         ext = os.path.splitext(path)[1].lower()
         if ext == ".dwg":
-            if not self.chkEnableDWG.isChecked() or not self._dwg_converter:
-                QMessageBox.information(
-                    self, "DWG disabled",
-                    "This build runs DXF-only by default (no external tools required).\n\n"
-                    "To use DWG, install ODA File Converter or LibreDWG (dwg2dxf), "
-                    "then enable 'Enable DWG'."
-                )
-                return
-
-            # Background DWG → temp DXF conversion
-            self._set_busy(True)
-            prefer = "auto"  # or 'oda' / 'libredwg'
-            def task_fn():
-                return dwg_to_temp_dxf_auto(path, prefer=prefer, dxf_version="ACAD2013")
-
-            def _done(_th, temp_dxf):
-                self._set_busy(False)
-                if not temp_dxf or not os.path.isfile(temp_dxf):
-                    QMessageBox.critical(self, "Error", "DWG conversion failed (no DXF produced).")
-                    return
-                self._temp_files.append(temp_dxf)
-                self._files = [temp_dxf]
-                self.inPath.setText(f"{path}  (via temp DXF)")
-                QMessageBox.information(self, "Info", "DWG converted to temporary DXF. You can Analyze / Show / Convert now.")
-
-            def _err(_th, msg):
-                self._set_busy(False)
-                QMessageBox.critical(self, "Error", msg)
-
-            self._run_in_thread(task_fn, _done, _err)
+            self._load_dwg(path)
             return
 
         # default DXF path
@@ -581,16 +683,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # cleanup temp DXFs created from DWG
         for p in list(self._temp_files):
-            try:
-                if os.path.isfile(p):
-                    os.remove(p)
-                folder = os.path.dirname(p)
-                try:
-                    os.rmdir(folder)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+            # the whole private temp folder (converters may leave extra files)
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
         self._temp_files.clear()
 
         # ensure no threads leak

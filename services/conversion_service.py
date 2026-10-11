@@ -982,6 +982,101 @@ def _convert_ogr_fallback(
     return _finalize(gdf, source_epsg, target_epsg, bbox_wgs84, say, tag="ogr")
 
 
+def _convert_gdal_cad(
+    dwg_paths: List[str],
+    *,
+    source_epsg: int = 3826,
+    target_epsg: Optional[int] = None,
+    target_layers: Optional[List[str]] = None,
+    bbox_wgs84: Optional[Tuple[float, float, float, float]] = None,
+    line_merge_tol: float = 0.0,
+    on_progress: ProgressCB = None,
+) -> Dict[Tuple[str, str], "gpd.GeoDataFrame"]:
+    """Read DWG directly with GDAL's CAD driver (libopencad).
+
+    Last-resort reader used when neither ODA nor LibreDWG is installed.
+    libopencad only supports DWG R2000 (AC1015) and a subset of entities
+    (POINT, LINE, (LW)POLYLINE, CIRCLE, ARC, ELLIPSE, TEXT, 3DFACE …); there is no
+    keep-merge for blocks. Each DWG layer is its own OGR layer.
+    """
+    say = _make_say(on_progress)
+    try:
+        from osgeo import gdal
+    except Exception as ex:
+        raise RuntimeError(f"GDAL is not available: {ex}")
+    import geopandas as gpd
+    from shapely import wkb as _wkb
+
+    sel_layers = set(target_layers) if target_layers else None
+    tol = float(line_merge_tol or 0.0)
+    rows: List[dict] = []
+    for path in dwg_paths:
+        say(f"[cad] read DWG directly (GDAL CAD driver): {path}")
+        try:
+            ds = gdal.OpenEx(path, gdal.OF_VECTOR, allowed_drivers=["CAD"])
+        except Exception as ex:
+            ds = None
+            say(f"[cad:error] {ex}")
+        if ds is None:
+            say(f"[cad:error] cannot open: {path} ({gdal.GetLastErrorMsg()})")
+            continue
+        for li in range(ds.GetLayerCount()):
+            lyr = ds.GetLayer(li)
+            layer_name = lyr.GetName() or "0"
+            if sel_layers and layer_name not in sel_layers:
+                continue
+            defn = lyr.GetLayerDefn()
+            fnames = [defn.GetFieldDefn(i).GetName() for i in range(defn.GetFieldCount())]
+            n = 0
+            for f in lyr:
+                try:
+                    g = f.GetGeometryRef()
+                    if g is None:
+                        continue
+                    try:
+                        lg = g.GetLinearGeometry() or g
+                    except Exception:
+                        lg = g
+                    sgeom = _wkb.loads(bytes(lg.ExportToWkb()))
+                    if sgeom is None or sgeom.is_empty:
+                        continue
+                    agg = _collapse_gc_preserve_multis(sgeom, tol, say)
+                    attrs = {}
+                    for name in ("cadgeom_type", "text"):
+                        if name in fnames:
+                            v = f.GetField(name)
+                            if v not in (None, ""):
+                                attrs[name] = v
+                    for gcode in ("LINE", "POLYGON", "POINT"):
+                        geom_out = agg.get(gcode)
+                        if geom_out is not None and not geom_out.is_empty:
+                            rows.append({"layer": layer_name, "geom": gcode, "geometry": geom_out, **attrs})
+                            n += 1
+                except Exception as ex:
+                    say(f"[cad:warn] feature read failed: {ex}")
+            say(f"[cad] layer {layer_name}: {n} rows")
+        ds = None
+
+    if not rows:
+        say("[cad] no rows")
+        return {}
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=f"EPSG:{source_epsg or 4326}")
+    return _finalize(gdf, source_epsg, target_epsg, bbox_wgs84, say, tag="cad")
+
+
+def _merge_buckets(a: dict, b: dict) -> dict:
+    """Combine two bucket dicts (same CRS), concatenating shared (layer, geom) keys."""
+    import geopandas as gpd
+    out = dict(a)
+    for k, g in b.items():
+        if k in out:
+            out[k] = gpd.GeoDataFrame(pd.concat([out[k], g], ignore_index=True),
+                                      geometry="geometry", crs=g.crs)
+        else:
+            out[k] = g
+    return out
+
+
 # ---------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------
@@ -1031,6 +1126,19 @@ def precise_convert(
     tol = float(merge_tolerance or 0.0)
     flat = float(flat_dist_precise or 0.2)
 
+    # *.dwg passed in directly = no ODA/LibreDWG available -> GDAL CAD driver
+    # (dwg_support.open_dwg() decides this; converted DWGs arrive here as temp DXF)
+    dwg_paths = [p for p in dxf_paths if p.lower().endswith(".dwg")]
+    dxf_paths = [p for p in dxf_paths if not p.lower().endswith(".dwg")]
+    dwg_buckets = {}
+    if dwg_paths:
+        dwg_buckets = _convert_gdal_cad(
+            dwg_paths, source_epsg=s_epsg, target_epsg=t_epsg,
+            target_layers=list(lyr_list) if lyr_list else None, bbox_wgs84=bbox_wgs84,
+            line_merge_tol=tol, on_progress=on_progress)
+        if not dxf_paths:
+            return dwg_buckets
+
     try:
         import ezdxf  # noqa: F401
         ez_ok = True
@@ -1039,19 +1147,19 @@ def precise_convert(
 
     if not ez_ok:
         _make_say(on_progress)("ezdxf not available → GDAL/OGR pipeline.")
-        return _convert_ogr_fallback(
+        return _merge_buckets(dwg_buckets, _convert_ogr_fallback(
             dxf_paths=dxf_paths, source_epsg=s_epsg, target_epsg=t_epsg,
             target_layers=list(lyr_list) if lyr_list else None, bbox_wgs84=bbox_wgs84,
             line_merge_tol=tol, flat_dist_precise=flat, block_mode=block_mode,
             on_progress=on_progress,
-        )
+        ))
 
-    return _precise_convert_ezdxf(
+    return _merge_buckets(dwg_buckets, _precise_convert_ezdxf(
         dxf_paths=dxf_paths, source_epsg=s_epsg, target_epsg=t_epsg,
         include_3d=include_3d, flat_dist_precise=flat,
         target_layers=list(lyr_list) if lyr_list else None, bbox_wgs84=bbox_wgs84,
         on_progress=on_progress, block_mode=block_mode or "keep-merge", line_merge_tol=tol,
-    )
+    ))
 
 
 # ---------------------------------------------------------------------
